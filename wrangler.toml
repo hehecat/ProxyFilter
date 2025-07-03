@@ -1,4 +1,4 @@
-name = "clash-filter-api"
+name = "proxy-filter"
 main = "src/index.js"
 compatibility_date = "2023-05-18"
 
