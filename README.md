@@ -19,6 +19,7 @@ ProxyFilter是一款基于Cloudflare Workers的在线工具，用于动态过滤
 - **节点重命名**：可自定义前缀，统一节点命名格式
 - **多URL合并**：支持同时处理多个配置源并合并结果
 - **代理组更新**：自动更新代理选择组，保持配置可用性
+- **智能测速功能**：自动测试节点连通性和延迟，过滤无效节点
 
 ### 快速开始
 
@@ -32,6 +33,10 @@ https://your-worker-url.workers.dev/?url=订阅地址&name=过滤条件&type=类
 - `url`：Clash配置URL或Base64数据，支持多个URL（逗号分隔）
 - `name`：节点名称过滤条件（支持正则表达式）
 - `type`：节点类型过滤条件（vmess、ss、trojan等）
+- `speed_test`：是否启用测速功能（true/false）
+- `timeout`：测速超时时间（毫秒，默认5000）
+- `max_latency`：最大允许延迟（毫秒，默认1000）
+- `concurrent_tests`：并发测试数量（默认5）
 
 #### 使用示例
 
@@ -53,6 +58,16 @@ https://your-worker-url.workers.dev/?url=订阅地址&name=过滤条件&type=类
 4. **直接数据输入**：处理Base64编码的URI列表
    ```
    https://your-worker-url.workers.dev/?url=data:text/plain;base64,aHlzdGVyaWEyOi8vLi4u
+   ```
+
+5. **启用测速功能**：自动测试节点连通性并过滤
+   ```
+   https://your-worker-url.workers.dev/?url=订阅地址&speed_test=true&max_latency=500
+   ```
+
+6. **完整测速配置**：自定义测速参数
+   ```
+   https://your-worker-url.workers.dev/?url=订阅地址&speed_test=true&timeout=3000&max_latency=800&concurrent_tests=3
    ```
 
 ### 支持的协议

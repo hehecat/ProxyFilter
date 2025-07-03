@@ -702,6 +702,17 @@ export default {
     let templateUrl = url.searchParams.get('template'); // 模板配置URL参数
     let templateContent = url.searchParams.get('template_content'); // 新增: 直接传递的模板内容
     let serverFilter = url.searchParams.get('server'); // 新增: 服务器类型过滤参数(domain或ip)
+
+    // 测速功能相关参数
+    let speedTest = url.searchParams.get('speed_test') === 'true'; // 是否启用测速
+    let speedTimeout = parseInt(url.searchParams.get('timeout')) || 5000; // 测速超时时间(毫秒)
+    let maxLatency = parseInt(url.searchParams.get('max_latency')) || 1000; // 最大允许延迟(毫秒)
+    let concurrentTests = parseInt(url.searchParams.get('concurrent_tests')) || 5; // 并发测试数量
+
+    // 验证测速参数范围
+    speedTimeout = Math.max(1000, Math.min(speedTimeout, 30000)); // 限制在1-30秒
+    maxLatency = Math.max(100, Math.min(maxLatency, 10000)); // 限制在100ms-10秒
+    concurrentTests = Math.max(1, Math.min(concurrentTests, 10)); // 限制在1-10个并发
     
     // 如果未提供参数，尝试使用环境变量中的默认值
     // 环境变量优先级: URL参数 > 环境变量
@@ -888,9 +899,38 @@ export default {
       
       // 重命名节点，使用名称过滤条件
       filteredProxies = renameProxies(filteredProxies, nameFilter);
-      
+
       // 记录过滤后节点数量
       const filteredCount = filteredProxies.length;
+
+      // 测速功能处理
+      let speedTestStats = null;
+      let speedFilterStats = null;
+      if (speedTest && filteredProxies.length > 0) {
+        console.log(`启用测速功能，准备测试${filteredProxies.length}个节点`);
+
+        try {
+          // 执行批量测速
+          const speedTestResult = await batchSpeedTest(filteredProxies, {
+            timeout: speedTimeout,
+            concurrentTests: concurrentTests,
+            useCache: true
+          });
+
+          speedTestStats = speedTestResult.stats;
+
+          // 根据延迟过滤节点
+          const filterResult = filterByLatency(speedTestResult.results, maxLatency);
+          filteredProxies = filterResult.filteredProxies;
+          speedFilterStats = filterResult.filterStats;
+
+          console.log(`测速完成，最终保留${filteredProxies.length}个节点`);
+
+        } catch (speedError) {
+          console.error('测速过程出错:', speedError);
+          // 测速失败不影响主功能，继续使用原有节点
+        }
+      }
       
       // 创建新的配置 - 使用模板或第一个配置
       const filteredConfig = {...firstConfig, proxies: filteredProxies};
@@ -907,9 +947,26 @@ export default {
       let filterInfo = `# 原始节点总计: ${totalOriginalCount}, 去重后: ${afterDedupeCount} (移除了${duplicateCount}个重复节点), 无效节点: ${invalidCount}, 过滤后节点: ${filteredCount}\n` +
                        `# 名称过滤: ${nameFilter || '无'} ${forceNameFilter ? '(强制: ' + forceNameFilter + ')' : ''}\n` +
                        `# 类型过滤: ${typeFilter || '无'} ${forceTypeFilter ? '(强制: ' + forceTypeFilter + ')' : ''}\n` +
-                       `# 服务器类型过滤: ${serverFilter || '无'} ${forceServerFilter ? '(强制: ' + forceServerFilter + ')' : ''}\n` +
-                       `# 生成时间: ${new Date().toISOString()}\n` +
-                       `# 配置源: \n# ${sourceUrlInfo.join('\n# ')}\n`;
+                       `# 服务器类型过滤: ${serverFilter || '无'} ${forceServerFilter ? '(强制: ' + forceServerFilter + ')' : ''}\n`;
+
+      // 添加测速信息
+      if (speedTest && speedTestStats) {
+        filterInfo += `# 测速功能: 已启用 (超时: ${speedTimeout}ms, 最大延迟: ${maxLatency}ms, 并发: ${concurrentTests})\n`;
+        filterInfo += `# 测速统计: 总计${speedTestStats.total}个，成功${speedTestStats.successful}个，失败${speedTestStats.failed}个，超时${speedTestStats.timeout}个\n`;
+
+        if (speedTestStats.successful > 0) {
+          filterInfo += `# 延迟统计: 平均${speedTestStats.avgLatency}ms，最小${speedTestStats.minLatency}ms，最大${speedTestStats.maxLatency}ms\n`;
+        }
+
+        if (speedFilterStats) {
+          filterInfo += `# 延迟过滤: 最终保留${speedFilterStats.filtered}个节点，移除${speedFilterStats.removed}个高延迟节点\n`;
+        }
+      } else if (speedTest) {
+        filterInfo += `# 测速功能: 已启用但未执行 (节点数量为0或发生错误)\n`;
+      }
+
+      filterInfo += `# 生成时间: ${new Date().toISOString()}\n` +
+                    `# 配置源: \n# ${sourceUrlInfo.join('\n# ')}\n`;
       
       // 生成 YAML 并返回
       const yamlString = filterInfo + yaml.dump(filteredConfig);
@@ -2924,4 +2981,435 @@ function preprocessYamlContent(content) {
   content = content.replace(/[\u0000-\u0008\u000B-\u000C\u000E-\u001F\u007F-\u009F]/g, '');
   
   return content;
+}
+
+// ==================== 测速功能相关函数 ====================
+
+/**
+ * 生成代理节点的缓存键
+ * @param {Object} proxy 代理节点对象
+ * @param {number} timeout 超时时间
+ * @returns {string} 缓存键
+ */
+function getSpeedTestCacheKey(proxy, timeout) {
+  return `speedtest:${proxy.server}:${proxy.port}:${timeout}`;
+}
+
+/**
+ * 测试单个代理的连通性和延迟
+ * @param {Object} proxy 代理节点对象
+ * @param {number} timeout 超时时间(毫秒)
+ * @param {boolean} useCache 是否使用缓存
+ * @returns {Promise<Object>} 测试结果 {success: boolean, latency: number, error: string}
+ */
+async function testProxyConnectivity(proxy, timeout = 5000, useCache = true) {
+  // 检查缓存
+  if (useCache) {
+    const cacheKey = getSpeedTestCacheKey(proxy, timeout);
+    const cachedResult = getCachedData(cacheKey);
+    if (cachedResult) {
+      console.log(`使用缓存的测速结果: ${proxy.server}:${proxy.port}`);
+      return cachedResult;
+    }
+  }
+  const startTime = Date.now();
+
+  try {
+    // 构建测试URL
+    let testUrl;
+    const server = proxy.server;
+    const port = proxy.port;
+
+    // 检查服务器地址是否有效
+    if (!server || !port) {
+      const result = {
+        success: false,
+        latency: -1,
+        error: '缺少服务器地址或端口'
+      };
+
+      // 缓存无效配置的结果
+      if (useCache) {
+        const cacheKey = getSpeedTestCacheKey(proxy, timeout);
+        setCachedData(cacheKey, result, 3600); // 缓存1小时
+      }
+
+      return result;
+    }
+
+    // 验证服务器地址格式
+    if (typeof server !== 'string' || server.length === 0) {
+      const result = {
+        success: false,
+        latency: -1,
+        error: '无效的服务器地址格式'
+      };
+
+      if (useCache) {
+        const cacheKey = getSpeedTestCacheKey(proxy, timeout);
+        setCachedData(cacheKey, result, 3600);
+      }
+
+      return result;
+    }
+
+    // 验证端口范围
+    const portNum = parseInt(port);
+    if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
+      const result = {
+        success: false,
+        latency: -1,
+        error: `无效的端口号: ${port}`
+      };
+
+      if (useCache) {
+        const cacheKey = getSpeedTestCacheKey(proxy, timeout);
+        setCachedData(cacheKey, result, 3600);
+      }
+
+      return result;
+    }
+
+    // 智能构建测试URL
+    // 根据端口和协议类型选择最合适的测试方法
+    const portNum = parseInt(port);
+
+    // 常见的HTTP/HTTPS端口
+    const httpPorts = [80, 8080, 3128, 8888, 8000, 9000];
+    const httpsPorts = [443, 8443, 9443];
+
+    if (httpsPorts.includes(portNum)) {
+      testUrl = `https://${server}:${port}`;
+    } else if (httpPorts.includes(portNum)) {
+      testUrl = `http://${server}:${port}`;
+    } else {
+      // 对于代理端口，尝试HTTP连接进行基础连通性测试
+      // 大多数情况下这会失败，但可以测试网络可达性
+      testUrl = `http://${server}:${port}`;
+    }
+
+    console.log(`测试连通性: ${proxy.name || 'Unknown'} -> ${testUrl}`);
+
+    // 创建AbortController用于超时控制
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      // 发起连接测试
+      const response = await fetch(testUrl, {
+        method: 'HEAD', // 使用HEAD方法减少数据传输
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'ProxyFilter-SpeedTest/1.0'
+        }
+      });
+
+      clearTimeout(timeoutId);
+      const latency = Date.now() - startTime;
+
+      // 即使返回错误状态码，只要能连接就认为是成功的
+      const result = {
+        success: true,
+        latency: latency,
+        error: null
+      };
+
+      // 缓存成功的测速结果
+      if (useCache) {
+        const cacheKey = getSpeedTestCacheKey(proxy, timeout);
+        setCachedData(cacheKey, result, 600); // 缓存10分钟
+      }
+
+      return result;
+
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+
+      // 检查是否是超时错误
+      if (fetchError.name === 'AbortError') {
+        const result = {
+          success: false,
+          latency: timeout,
+          error: '连接超时'
+        };
+
+        // 缓存超时结果（较短时间）
+        if (useCache) {
+          const cacheKey = getSpeedTestCacheKey(proxy, timeout);
+          setCachedData(cacheKey, result, 300); // 缓存5分钟
+        }
+
+        return result;
+      }
+
+      // 对于某些网络错误，我们仍然可以测量到响应时间
+      const latency = Date.now() - startTime;
+
+      // 如果是CORS错误或其他网络错误，但响应时间合理，可能服务器是可达的
+      if (latency < timeout && (
+        fetchError.message.includes('CORS') ||
+        fetchError.message.includes('network') ||
+        fetchError.message.includes('fetch')
+      )) {
+        const result = {
+          success: true,
+          latency: latency,
+          error: `网络可达但协议不兼容: ${fetchError.message}`
+        };
+
+        // 缓存可达但协议不兼容的结果
+        if (useCache) {
+          const cacheKey = getSpeedTestCacheKey(proxy, timeout);
+          setCachedData(cacheKey, result, 600); // 缓存10分钟
+        }
+
+        return result;
+      }
+
+      return {
+        success: false,
+        latency: latency,
+        error: fetchError.message
+      };
+    }
+
+  } catch (error) {
+    const latency = Date.now() - startTime;
+    return {
+      success: false,
+      latency: latency,
+      error: `测试失败: ${error.message}`
+    };
+  }
+}
+
+/**
+ * 批量测速代理节点
+ * @param {Array} proxies 代理节点数组
+ * @param {Object} options 测速选项 {timeout, concurrentTests, useCache}
+ * @returns {Promise<Object>} 测速结果 {results: Array, stats: Object}
+ */
+async function batchSpeedTest(proxies, options = {}) {
+  const { timeout = 5000, concurrentTests = 5, useCache = true } = options;
+  const results = [];
+  const stats = {
+    total: proxies.length,
+    tested: 0,
+    successful: 0,
+    failed: 0,
+    timeout: 0,
+    avgLatency: 0,
+    minLatency: Infinity,
+    maxLatency: 0
+  };
+
+  console.log(`开始批量测速，共${proxies.length}个节点，并发数：${concurrentTests}，超时：${timeout}ms`);
+
+  // 分批处理，控制并发数量
+  const totalBatches = Math.ceil(proxies.length / concurrentTests);
+  let currentBatch = 0;
+
+  for (let i = 0; i < proxies.length; i += concurrentTests) {
+    currentBatch++;
+    console.log(`处理批次 ${currentBatch}/${totalBatches} (节点 ${i + 1}-${Math.min(i + concurrentTests, proxies.length)})`);
+    const batch = proxies.slice(i, i + concurrentTests);
+
+    // 并发测试当前批次
+    const batchPromises = batch.map(async (proxy, index) => {
+      const globalIndex = i + index;
+      try {
+        const result = await testProxyConnectivity(proxy, timeout, useCache);
+        return {
+          proxy: proxy,
+          index: globalIndex,
+          ...result
+        };
+      } catch (error) {
+        return {
+          proxy: proxy,
+          index: globalIndex,
+          success: false,
+          latency: -1,
+          error: `测试异常: ${error.message}`
+        };
+      }
+    });
+
+    // 等待当前批次完成
+    const batchResults = await Promise.allSettled(batchPromises);
+
+    // 处理批次结果
+    batchResults.forEach((promiseResult, batchIndex) => {
+      const globalIndex = i + batchIndex;
+      let testResult;
+
+      if (promiseResult.status === 'fulfilled') {
+        testResult = promiseResult.value;
+      } else {
+        testResult = {
+          proxy: batch[batchIndex],
+          index: globalIndex,
+          success: false,
+          latency: -1,
+          error: `Promise rejected: ${promiseResult.reason}`
+        };
+      }
+
+      results.push(testResult);
+      stats.tested++;
+
+      // 更新统计信息
+      if (testResult.success) {
+        stats.successful++;
+        if (testResult.latency > 0) {
+          stats.minLatency = Math.min(stats.minLatency, testResult.latency);
+          stats.maxLatency = Math.max(stats.maxLatency, testResult.latency);
+        }
+      } else {
+        stats.failed++;
+        if (testResult.error && testResult.error.includes('超时')) {
+          stats.timeout++;
+        }
+      }
+    });
+
+    // 添加小延迟避免过于频繁的请求
+    if (i + concurrentTests < proxies.length) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+
+  // 计算平均延迟
+  const successfulResults = results.filter(r => r.success && r.latency > 0);
+  if (successfulResults.length > 0) {
+    stats.avgLatency = Math.round(
+      successfulResults.reduce((sum, r) => sum + r.latency, 0) / successfulResults.length
+    );
+  }
+
+  // 修正最小延迟
+  if (stats.minLatency === Infinity) {
+    stats.minLatency = 0;
+  }
+
+  console.log(`测速完成: 成功${stats.successful}个，失败${stats.failed}个，平均延迟${stats.avgLatency}ms`);
+
+  return { results, stats };
+}
+
+/**
+ * 根据延迟过滤和排序代理节点
+ * @param {Array} speedTestResults 测速结果数组
+ * @param {number} maxLatency 最大允许延迟(毫秒)
+ * @returns {Object} 过滤结果 {filteredProxies: Array, filterStats: Object}
+ */
+function filterByLatency(speedTestResults, maxLatency = 1000) {
+  const filterStats = {
+    total: speedTestResults.length,
+    successful: 0,
+    filtered: 0,
+    removed: 0
+  };
+
+  // 只保留测速成功的节点
+  const successfulResults = speedTestResults.filter(result => {
+    if (result.success) {
+      filterStats.successful++;
+      return true;
+    }
+    return false;
+  });
+
+  // 根据延迟过滤
+  const filteredResults = successfulResults.filter(result => {
+    if (result.latency <= maxLatency) {
+      filterStats.filtered++;
+      return true;
+    } else {
+      filterStats.removed++;
+      return false;
+    }
+  });
+
+  // 按延迟排序（从低到高）
+  filteredResults.sort((a, b) => a.latency - b.latency);
+
+  // 提取代理节点并添加延迟信息
+  const filteredProxies = filteredResults.map(result => {
+    const proxy = { ...result.proxy };
+    // 在代理节点中添加延迟信息（作为注释）
+    proxy._speedTest = {
+      latency: result.latency,
+      tested: true,
+      success: result.success
+    };
+    return proxy;
+  });
+
+  console.log(`延迟过滤完成: 总计${filterStats.total}个，成功${filterStats.successful}个，通过过滤${filterStats.filtered}个，移除${filterStats.removed}个`);
+
+  return { filteredProxies, filterStats };
+}
+
+/**
+ * 生成延迟分布统计
+ * @param {Array} speedTestResults 测速结果数组
+ * @returns {Object} 延迟分布统计
+ */
+function generateLatencyDistribution(speedTestResults) {
+  const ranges = [
+    { min: 0, max: 200, name: '<200ms', count: 0 },
+    { min: 200, max: 500, name: '200-500ms', count: 0 },
+    { min: 500, max: 1000, name: '500-1000ms', count: 0 },
+    { min: 1000, max: 2000, name: '1-2s', count: 0 },
+    { min: 2000, max: Infinity, name: '>2s', count: 0 }
+  ];
+
+  speedTestResults.forEach(result => {
+    if (result.success && result.latency > 0) {
+      for (const range of ranges) {
+        if (result.latency >= range.min && result.latency < range.max) {
+          range.count++;
+          break;
+        }
+      }
+    }
+  });
+
+  return ranges;
+}
+
+/**
+ * 生成测速统计信息
+ * @param {Object} speedStats 测速统计
+ * @param {Object} filterStats 过滤统计
+ * @param {Array} speedTestResults 测速结果数组
+ * @param {number} maxLatency 最大延迟限制
+ * @returns {string} 格式化的统计信息
+ */
+function generateSpeedTestInfo(speedStats, filterStats, speedTestResults, maxLatency) {
+  const lines = [];
+
+  lines.push(`# 测速统计: 总计${speedStats.total}个节点，成功${speedStats.successful}个，失败${speedStats.failed}个，超时${speedStats.timeout}个`);
+
+  if (speedStats.successful > 0) {
+    lines.push(`# 延迟统计: 平均${speedStats.avgLatency}ms，最小${speedStats.minLatency}ms，最大${speedStats.maxLatency}ms`);
+
+    // 生成延迟分布统计
+    if (speedTestResults && speedTestResults.length > 0) {
+      const distribution = generateLatencyDistribution(speedTestResults);
+      const distributionText = distribution
+        .filter(range => range.count > 0)
+        .map(range => `${range.name}: ${range.count}个`)
+        .join(', ');
+
+      if (distributionText) {
+        lines.push(`# 延迟分布: ${distributionText}`);
+      }
+    }
+  }
+
+  lines.push(`# 过滤设置: 最大延迟${maxLatency}ms，最终保留${filterStats.filtered}个节点`);
+
+  return lines.join('\n');
 }
