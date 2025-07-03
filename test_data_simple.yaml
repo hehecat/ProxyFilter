@@ -1,0 +1,56 @@
+# 简单测试数据
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+
+proxies:
+  - name: "香港-测试节点1"
+    type: vmess
+    server: www.google.com
+    port: 443
+    uuid: 12345678-1234-1234-1234-123456789abc
+    alterId: 0
+    cipher: auto
+    
+  - name: "香港-测试节点2"
+    type: ss
+    server: www.cloudflare.com
+    port: 443
+    cipher: aes-256-gcm
+    password: test123
+    
+  - name: "美国-测试节点1"
+    type: trojan
+    server: www.github.com
+    port: 443
+    password: test123
+    
+  - name: "日本-测试节点1"
+    type: vmess
+    server: www.yahoo.com
+    port: 80
+    uuid: 12345678-1234-1234-1234-123456789abc
+    alterId: 0
+    cipher: auto
+    
+  - name: "失败节点"
+    type: ss
+    server: invalid-server-that-should-fail.example.com
+    port: 12345
+    cipher: aes-256-gcm
+    password: test123
+
+proxy-groups:
+  - name: "🚀 节点选择"
+    type: select
+    proxies:
+      - "香港-测试节点1"
+      - "香港-测试节点2"
+      - "美国-测试节点1"
+      - "日本-测试节点1"
+      - "失败节点"
+
+rules:
+  - DOMAIN-SUFFIX,google.com,🚀 节点选择
+  - MATCH,DIRECT

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ProxyFilter 测速功能测试</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        textarea {
+            height: 80px;
+            resize: vertical;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 4px;
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .result.success {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .result.error {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .loading {
+            text-align: center;
+            color: #007bff;
+            font-style: italic;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .checkbox-group input[type="checkbox"] {
+            width: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ProxyFilter 测速功能测试</h1>
+        
+        <form id="testForm">
+            <div class="form-group">
+                <label for="workerUrl">Worker URL:</label>
+                <input type="url" id="workerUrl" placeholder="https://your-worker.workers.dev" value="http://localhost:8787" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="subscriptionUrl">订阅地址:</label>
+                <textarea id="subscriptionUrl" placeholder="输入订阅地址">http://127.0.0.1:8787/test_data_simple.yaml</textarea>
+                <small style="color: #666; font-size: 12px;">
+                    💡 提示：<br>
+                    • 使用上面的测试地址进行功能验证<br>
+                    • 或输入您的真实Clash订阅地址<br>
+                    • 支持多个地址，用逗号分隔
+                </small>
+            </div>
+            
+            <div class="form-group">
+                <label for="nameFilter">名称过滤:</label>
+                <input type="text" id="nameFilter" placeholder="例如: 香港" value="香港">
+            </div>
+            
+            <div class="form-group">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="speedTest" checked>
+                    <label for="speedTest">启用测速功能</label>
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label for="timeout">测速超时时间 (毫秒):</label>
+                <input type="number" id="timeout" value="3000" min="1000" max="30000">
+            </div>
+            
+            <div class="form-group">
+                <label for="maxLatency">最大允许延迟 (毫秒):</label>
+                <input type="number" id="maxLatency" value="800" min="100" max="10000">
+            </div>
+            
+            <button type="submit" id="testButton">开始测试</button>
+        </form>
+        
+        <div id="result"></div>
+    </div>
+
+    <script>
+        document.getElementById('testForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const button = document.getElementById('testButton');
+            const resultDiv = document.getElementById('result');
+            
+            // 获取表单数据
+            const workerUrl = document.getElementById('workerUrl').value.trim();
+            const subscriptionUrl = document.getElementById('subscriptionUrl').value.trim();
+            const nameFilter = document.getElementById('nameFilter').value.trim();
+            const speedTest = document.getElementById('speedTest').checked;
+            const timeout = document.getElementById('timeout').value;
+            const maxLatency = document.getElementById('maxLatency').value;
+            
+            if (!workerUrl) {
+                alert('请输入 Worker URL');
+                return;
+            }
+            
+            // 构建请求URL
+            const params = new URLSearchParams();
+            if (subscriptionUrl) params.append('url', subscriptionUrl);
+            if (nameFilter) params.append('name', nameFilter);
+            if (speedTest) {
+                params.append('speed_test', 'true');
+                params.append('timeout', timeout);
+                params.append('max_latency', maxLatency);
+                params.append('concurrent_tests', '3');
+            }
+            
+            const testUrl = `${workerUrl}?${params.toString()}`;
+            
+            // 显示加载状态
+            button.disabled = true;
+            button.textContent = '测试中...';
+            resultDiv.innerHTML = '<div class="loading">正在处理请求，请稍候...</div>';
+            
+            try {
+                const startTime = Date.now();
+                const response = await fetch(testUrl);
+                const endTime = Date.now();
+                const responseTime = endTime - startTime;
+                
+                const result = await response.text();
+                
+                if (response.ok) {
+                    resultDiv.innerHTML = `<div class="result success">✅ 请求成功 (${responseTime}ms)\n\n${result}</div>`;
+                } else {
+                    resultDiv.innerHTML = `<div class="result error">❌ 请求失败 (${response.status})\n\n${result}</div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="result error">❌ 网络错误\n\n${error.message}</div>`;
+            } finally {
+                button.disabled = false;
+                button.textContent = '开始测试';
+            }
+        });
+    </script>
+</body>
+</html>
